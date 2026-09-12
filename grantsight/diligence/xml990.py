@@ -41,28 +41,41 @@ and provenance is inspectable.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import os
 import re
 import sqlite3
+import struct
+import sys
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 from xml.etree import ElementTree
 
+from .http import FetchError, content_length, get_bytes, get_range
 from .propublica import clean_ein
 
 DATA_DIR = Path(os.environ.get("GRANTSIGHT_DATA", "./data"))
 XML_DB = DATA_DIR / "xml_index.sqlite3"
+BATCH_DB = DATA_DIR / "xml_batches.sqlite3"
 XML_CORPUS = Path(os.environ.get("GRANTSIGHT_XML_DIR", "./data/xml"))
+XML_CACHE = DATA_DIR / "xml-cache"
 
-# Per-object URL pattern. Configurable because the IRS has moved this corpus
-# before; when it is unset or fails, a local corpus directory is used instead.
-OBJECT_URL = os.environ.get(
-    "GRANTSIGHT_XML_OBJECT_URL",
-    "https://s3.amazonaws.com/irs-form-990/{object_id}_public.xml",
+# The IRS publishes the corpus as yearly batch zips (70-500 MB each), named in
+# the index CSV's XML_BATCH_ID column. A filing is pulled out of its zip with
+# HTTP range requests, so only the zip's directory and that one member are
+# ever downloaded.
+BATCH_URL = os.environ.get(
+    "GRANTSIGHT_XML_BATCH_URL",
+    "https://apps.irs.gov/pub/epostcard/990/xml/{year}/{batch}.zip",
 )
+
+# Optional per-object URL for operators who mirror the corpus themselves. The
+# historical public per-object bucket (s3://irs-form-990) is gone, so no default.
+OBJECT_URL = os.environ.get("GRANTSIGHT_XML_OBJECT_URL")
 
 MAX_PEOPLE = 25
 MAX_GRANTS = 50
@@ -422,12 +435,14 @@ def parse(source: bytes | str | Path) -> Form990XML:
     root = Node(tree)
     result = Form990XML()
 
-    # Header
-    ein = root.text("EIN")
+    # Header. The preparer firm's name precedes the filer's in the header, so
+    # scope the lookups to the Filer block when there is one.
+    filer = root.first("Filer") or root
+    ein = filer.text("EIN")
     if ein and re.sub(r"\D", "", ein):
         result.ein = re.sub(r"\D", "", ein).zfill(9)
     result.name = _clean_name(
-        root.text("BusinessNameLine1Txt", "BusinessNameLine1")
+        filer.text("BusinessNameLine1Txt", "BusinessNameLine1")
     )
     result.website = root.text("WebsiteAddressTxt", "WebsiteAddress")
     result.principal_officer = _clean_name(
@@ -479,7 +494,7 @@ def parse(source: bytes | str | Path) -> Form990XML:
 # locating a filing
 # ---------------------------------------------------------------------------
 def build_index(index_csvs: list[str]) -> dict:
-    """Index the IRS per-year index CSVs: EIN -> object id, year, form type."""
+    """Index the IRS per-year index CSVs: EIN -> object id, year, form, batch."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = XML_DB.with_suffix(".building")
     tmp.unlink(missing_ok=True)
@@ -487,7 +502,7 @@ def build_index(index_csvs: list[str]) -> dict:
     conn.executescript(
         """
         CREATE TABLE filings (
-            ein TEXT, tax_year INTEGER, object_id TEXT, form_type TEXT,
+            ein TEXT, tax_year INTEGER, object_id TEXT, form_type TEXT, batch TEXT,
             PRIMARY KEY (ein, tax_year, object_id)
         );
         CREATE INDEX filings_ein ON filings (ein, tax_year DESC);
@@ -496,10 +511,10 @@ def build_index(index_csvs: list[str]) -> dict:
 
     loaded = 0
     for source in index_csvs:
-        path = Path(source)
-        if not path.exists():
-            print(f"  ! {path} not found")
+        path = _resolve_source(source)
+        if path is None:
             continue
+        before = loaded
         for stream in _text_members(path):
             reader = csv.reader(stream)
             try:
@@ -511,10 +526,12 @@ def build_index(index_csvs: list[str]) -> dict:
             obj_i = cols.get("OBJECT_ID")
             year_i = cols.get("TAX_PERIOD") or cols.get("TAXPERIOD")
             form_i = cols.get("RETURN_TYPE")
+            batch_i = cols.get("XML_BATCH_ID")
             if ein_i is None or obj_i is None:
-                print(f"  ! {path.name}: no EIN/OBJECT_ID column; saw {header[:6]}")
+                print(f"  ! {path.name}: no EIN/OBJECT_ID column; saw {header[:6]}",
+                      file=sys.stderr)
                 continue
-            batch = []
+            rows = []
             for row in reader:
                 if len(row) <= max(ein_i, obj_i):
                     continue
@@ -527,20 +544,54 @@ def build_index(index_csvs: list[str]) -> dict:
                     if len(digits) >= 4:
                         year = int(digits[:4])
                 form = row[form_i].strip() if form_i is not None and len(row) > form_i else None
-                batch.append((ein, year, row[obj_i].strip(), form))
+                batch = row[batch_i].strip() if batch_i is not None and len(row) > batch_i else None
+                rows.append((ein, year, row[obj_i].strip(), form, batch or None))
                 loaded += 1
-                if len(batch) >= 10_000:
+                if len(rows) >= 10_000:
                     conn.executemany(
-                        "INSERT OR REPLACE INTO filings VALUES (?,?,?,?)", batch
+                        "INSERT OR REPLACE INTO filings VALUES (?,?,?,?,?)", rows
                     )
-                    batch.clear()
-            if batch:
-                conn.executemany("INSERT OR REPLACE INTO filings VALUES (?,?,?,?)", batch)
+                    rows.clear()
+            if rows:
+                conn.executemany("INSERT OR REPLACE INTO filings VALUES (?,?,?,?,?)", rows)
+        print(f"  {source}: {loaded - before:,} filings")
     conn.commit()
     conn.close()
+    if not loaded:
+        tmp.unlink(missing_ok=True)
+        print("  !! no index rows loaded; xml_index.sqlite3 not written", file=sys.stderr)
+        return {"rows": 0, "db": None}
     tmp.replace(XML_DB)
     print(f"  indexed {loaded:,} filings")
     return {"rows": loaded, "db": str(XML_DB)}
+
+
+def _resolve_source(source: str) -> Path | None:
+    """A local path, or an http(s) URL downloaded into DATA_DIR."""
+    source = source.strip()
+    if not source:
+        return None
+    if source.startswith(("http://", "https://")):
+        digest = hashlib.sha256(source.encode()).hexdigest()[:12]
+        try:
+            path = get_bytes(source, DATA_DIR / f"xml-index-{digest}.csv")
+        except FetchError as exc:
+            print(f"\n  !! DOWNLOAD FAILED: {source}\n     {exc}\n", file=sys.stderr)
+            return None
+        head = path.open("rb").read(200).lstrip().lower()
+        if head.startswith((b"<!doctype html", b"<html")):
+            print(f"\n  !! {source}\n     returned an HTML page, not an index CSV. The "
+                  f"directory year in the URL must match the filename year.\n",
+                  file=sys.stderr)
+            path.unlink(missing_ok=True)
+            return None
+        return path
+    path = Path(source)
+    if not path.is_file():
+        what = "is a directory, not a file" if path.is_dir() else "does not exist"
+        print(f"  ! {path} {what}", file=sys.stderr)
+        return None
+    return path
 
 
 def _text_members(path: Path):
@@ -555,54 +606,198 @@ def _text_members(path: Path):
             yield handle
 
 
-def object_ids(ein: str, limit: int = 3) -> list[tuple[str, int | None]]:
-    """Most recent object ids for an EIN, newest first."""
+@dataclass
+class IndexedFiling:
+    object_id: str
+    tax_year: int | None
+    form_type: str | None
+    batch: str | None
+
+
+# A 990-T (unrelated business income) carries none of the Part VII / Part IX
+# content this module exists for, so it sorts after the information return.
+_RETURN_PRIORITY = "CASE WHEN form_type LIKE '990T%' THEN 1 ELSE 0 END"
+
+
+def index_is_current() -> bool:
+    """True when xml_index.sqlite3 exists and has the batch column."""
+    if not XML_DB.exists():
+        return False
+    conn = sqlite3.connect(f"file:{XML_DB}?mode=ro", uri=True)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(filings)")}
+        return "batch" in cols
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def indexed_filings(ein: str, limit: int = 3) -> list[IndexedFiling]:
+    """Most recent indexed filings for an EIN, newest first, 990-T last."""
     if not XML_DB.exists():
         return []
     conn = sqlite3.connect(f"file:{XML_DB}?mode=ro", uri=True)
     try:
         rows = conn.execute(
-            "SELECT object_id, tax_year FROM filings WHERE ein = ? "
-            "ORDER BY tax_year DESC LIMIT ?",
+            "SELECT object_id, tax_year, form_type, batch FROM filings WHERE ein = ? "
+            f"ORDER BY {_RETURN_PRIORITY}, tax_year DESC LIMIT ?",
             (clean_ein(ein), limit),
         ).fetchall()
-        return [(r[0], r[1]) for r in rows]
+        return [IndexedFiling(*r) for r in rows]
     except sqlite3.Error:
         return []
     finally:
         conn.close()
 
 
+def object_ids(ein: str, limit: int = 3) -> list[tuple[str, int | None]]:
+    """Most recent object ids for an EIN, newest first."""
+    return [(f.object_id, f.tax_year) for f in indexed_filings(ein, limit)]
+
+
 def load_for(ein: str) -> Form990XML | None:
     """Find and parse the most recent XML filing available for an EIN.
 
-    Looks in a local corpus directory first, then at the configured per-object
-    URL. Returns None when nothing is available -- callers degrade to the
-    SOI-only brief and say which fields are therefore missing.
+    Looks in a local corpus directory, then the per-object cache, then pulls
+    the member out of the IRS batch zip (or a configured per-object URL).
+    Returns None when nothing is available -- callers degrade to the SOI-only
+    brief and say which fields are therefore missing.
     """
     ein = clean_ein(ein)
+    filings = indexed_filings(ein)
 
-    for object_id, _year in object_ids(ein):
-        local = XML_CORPUS / f"{object_id}_public.xml"
-        if local.exists():
-            return parse(local)
+    for f in filings:
+        for local in (XML_CORPUS / f"{f.object_id}_public.xml",
+                      XML_CACHE / f"{f.object_id}.xml"):
+            if local.exists():
+                return parse(local)
 
-    # Fall back to a per-object fetch when a URL template is configured.
-    if not OBJECT_URL:
-        return None
-    from .http import FetchError, get_bytes
-
-    for object_id, _year in object_ids(ein):
+    for f in filings:
         try:
-            path = get_bytes(
-                OBJECT_URL.format(object_id=object_id),
-                DATA_DIR / "xml-cache" / f"{object_id}.xml",
-                ttl_s=60 * 60 * 24 * 30,
-            )
-            return parse(path)
+            data = _fetch_object(f)
         except FetchError:
             continue
+        if data is None:
+            continue
+        XML_CACHE.mkdir(parents=True, exist_ok=True)
+        (XML_CACHE / f"{f.object_id}.xml").write_bytes(data)
+        return parse(data)
     return None
+
+
+def _fetch_object(f: IndexedFiling) -> bytes | None:
+    if OBJECT_URL:
+        path = get_bytes(
+            OBJECT_URL.format(object_id=f.object_id),
+            XML_CACHE / f"{f.object_id}.xml",
+            ttl_s=60 * 60 * 24 * 30,
+        )
+        return path.read_bytes()
+    if not f.batch or not BATCH_URL:
+        return None
+    url = BATCH_URL.format(year=f.batch[:4], batch=f.batch)
+    return _remote_zip_member(url, f.batch, f"{f.object_id}_public.xml")
+
+
+# ---------------------------------------------------------------------------
+# one member out of a remote zip, by HTTP range requests
+# ---------------------------------------------------------------------------
+def _batch_conn() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(BATCH_DB, timeout=30)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS members (
+            batch TEXT, name TEXT, method INTEGER, csize INTEGER, offset INTEGER,
+            PRIMARY KEY (batch, name)
+        );
+        CREATE TABLE IF NOT EXISTS batches (batch TEXT PRIMARY KEY, entries INTEGER);
+        """
+    )
+    return conn
+
+
+def _remote_zip_member(url: str, batch: str, name: str) -> bytes | None:
+    conn = _batch_conn()
+    try:
+        if not conn.execute("SELECT 1 FROM batches WHERE batch = ?", (batch,)).fetchone():
+            entries = list(_remote_zip_directory(url))
+            conn.executemany(
+                "INSERT OR REPLACE INTO members VALUES (?,?,?,?,?)",
+                [(batch, n, m, c, o) for n, m, c, o in entries],
+            )
+            conn.execute("INSERT OR REPLACE INTO batches VALUES (?,?)", (batch, len(entries)))
+            conn.commit()
+        row = conn.execute(
+            "SELECT method, csize, offset FROM members WHERE batch = ? AND name = ?",
+            (batch, name),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    method, csize, offset = row
+    head = get_range(url, offset, offset + 29)
+    if head[:4] != b"PK\x03\x04":
+        raise FetchError(f"{url}: bad local header for {name}")
+    name_len, extra_len = struct.unpack("<HH", head[26:30])
+    start = offset + 30 + name_len + extra_len
+    data = get_range(url, start, start + csize - 1)
+    if method == 8:
+        return zlib.decompress(data, -15)
+    if method == 0:
+        return data
+    raise FetchError(f"{url}: unsupported compression method {method}")
+
+
+def _remote_zip_directory(url: str) -> Iterator[tuple[str, int, int, int]]:
+    """(name, method, compressed size, local header offset) for every member
+    of the zip at `url`, reading only its central directory. Handles ZIP64."""
+    size = content_length(url)
+    tail_len = min(size, 1 << 16)
+    tail_start = size - tail_len
+    tail = get_range(url, tail_start, size - 1)
+    eocd = tail.rfind(b"PK\x05\x06")
+    if eocd < 0:
+        raise FetchError(f"{url}: not a zip file")
+    cd_count, cd_size, cd_off = struct.unpack("<HII", tail[eocd + 10:eocd + 20])
+    if cd_count == 0xFFFF or 0xFFFFFFFF in (cd_size, cd_off):
+        loc = tail.rfind(b"PK\x06\x07")
+        if loc < 0:
+            raise FetchError(f"{url}: zip64 locator missing")
+        z64_off = struct.unpack("<Q", tail[loc + 8:loc + 16])[0]
+        if z64_off >= tail_start:
+            z64 = tail[z64_off - tail_start:z64_off - tail_start + 56]
+        else:
+            z64 = get_range(url, z64_off, z64_off + 55)
+        cd_count, cd_size, cd_off = struct.unpack("<QQQ", z64[32:56])
+
+    cd = get_range(url, cd_off, cd_off + cd_size - 1)
+    p = 0
+    while p + 46 <= len(cd) and cd[p:p + 4] == b"PK\x01\x02":
+        method = struct.unpack("<H", cd[p + 10:p + 12])[0]
+        csize, usize = struct.unpack("<II", cd[p + 20:p + 28])
+        name_len, extra_len, comment_len = struct.unpack("<HHH", cd[p + 28:p + 34])
+        offset = struct.unpack("<I", cd[p + 42:p + 46])[0]
+        name = cd[p + 46:p + 46 + name_len].decode("utf-8", "replace")
+        extra = cd[p + 46 + name_len:p + 46 + name_len + extra_len]
+        if 0xFFFFFFFF in (csize, usize, offset):
+            q = 0
+            while q + 4 <= len(extra):
+                header_id, length = struct.unpack("<HH", extra[q:q + 4])
+                if header_id == 1:
+                    values = list(struct.unpack(f"<{length // 8}Q", extra[q + 4:q + 4 + length]))
+                    if usize == 0xFFFFFFFF and values:
+                        usize = values.pop(0)
+                    if csize == 0xFFFFFFFF and values:
+                        csize = values.pop(0)
+                    if offset == 0xFFFFFFFF and values:
+                        offset = values.pop(0)
+                    break
+                q += 4 + length
+        yield name, method, csize, offset
+        p += 46 + name_len + extra_len + comment_len
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI
@@ -613,12 +808,17 @@ if __name__ == "__main__":  # pragma: no cover - CLI
     parser.add_argument("--build-index", action="extend", nargs="+", default=[],
                         metavar="INDEX_CSV",
                         help="IRS index CSV paths or URLs (one or more; repeatable)")
+    parser.add_argument("--check-index", action="store_true",
+                        help="exit 0 if the built index has the current schema")
     parser.add_argument("--file", type=Path, help="parse one XML file")
     parser.add_argument("--ein", help="find and parse the latest filing for an EIN")
     args = parser.parse_args()
 
+    if args.check_index:
+        raise SystemExit(0 if index_is_current() else 1)
     if args.build_index:
-        build_index(args.build_index)
+        if not build_index(args.build_index)["rows"]:
+            raise SystemExit(1)
     target = parse(args.file) if args.file else (load_for(args.ein) if args.ein else None)
     if target is None:
         if not args.build_index:
