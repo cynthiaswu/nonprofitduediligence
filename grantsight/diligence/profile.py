@@ -350,16 +350,72 @@ def build(brief, search: SearchFn | None = None, check_site: bool = True) -> Hig
     return h
 
 
+GNEWS_ENDPOINT = "https://gnews.io/api/v4/search"
+
+
+def gnews_provider(api_key: str, endpoint: str = GNEWS_ENDPOINT) -> SearchFn:
+    """Search adapter for GNews (https://gnews.io/docs/v4).
+
+    Only the quoted organization name is sent; GNews ANDs every term, so the
+    city/state/"nonprofit" terms from build_query would drop articles that
+    name the organization without them. Identity confirmation in find_press
+    still requires a city, state, EIN or domain corroborator in the returned
+    title, description or content.
+    """
+
+    def search(query: str):
+        import httpx
+
+        from . import USER_AGENT
+
+        match = re.search(r'"([^"]+)"', query)
+        q = f'"{match.group(1)}"' if match else query
+        response = httpx.get(
+            endpoint,
+            params={
+                "q": q, "lang": "en", "country": "us", "max": 10,
+                "sortby": "publishedAt", "apikey": api_key,
+            },
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        articles = response.json().get("articles") or []
+        out = []
+        for a in articles:
+            if not isinstance(a, dict):
+                continue
+            snippet = " ".join(
+                s for s in (a.get("description"), a.get("content")) if s
+            )
+            out.append({
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "snippet": snippet or None,
+                "source": _pick(a, "source"),
+                "published": (a.get("publishedAt") or "")[:10] or None,
+            })
+        return out
+
+    return search
+
+
 def _provider_from_env() -> SearchFn | None:
     """Build a provider from env, for operators who have a search API.
+
+    GNEWS_API_KEY         use GNews; takes precedence when set
 
     GRANTSIGHT_NEWS_URL   a URL template containing {query}
     GRANTSIGHT_NEWS_KEY   optional, sent as Authorization: Bearer
     GRANTSIGHT_NEWS_PATH  dotted path to the result list, default "results"
 
-    Results are read leniently: each item's title, url, snippet, source and
-    published are taken from the first key that exists.
+    Generic results are read leniently: each item's title, url, snippet,
+    source and published are taken from the first key that exists.
     """
+    gnews_key = os.environ.get("GNEWS_API_KEY")
+    if gnews_key:
+        return gnews_provider(gnews_key)
+
     template = os.environ.get("GRANTSIGHT_NEWS_URL")
     if not template:
         return None

@@ -1071,6 +1071,48 @@ def test_find_press_drops_unconfirmed_items_silently():
     assert items[0].source == "Baltimore Banner"
 
 
+def test_gnews_provider_maps_articles_and_sends_only_the_quoted_name(monkeypatch):
+    import httpx
+
+    seen = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen.update(url=url, params=params)
+        return httpx.Response(200, json={"totalArticles": 1, "articles": [
+            {"title": "Harbor Street Youth Coalition wins grant",
+             "description": "The Baltimore organization received funding.",
+             "content": "Full text... [1200 chars]",
+             "url": "https://x.example/right",
+             "publishedAt": "2026-04-02T14:00:00Z",
+             "source": {"name": "Baltimore Banner", "url": "https://banner.example"}},
+            "not-a-dict",
+        ]}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    search = profile_mod.gnews_provider("k")
+    items = list(search(profile_mod.build_query(HARBOR)))
+
+    assert seen["url"] == profile_mod.GNEWS_ENDPOINT
+    assert seen["params"]["q"] == f'"{HARBOR["name"]}"'
+    assert seen["params"]["apikey"] == "k"
+    assert items == [{
+        "title": "Harbor Street Youth Coalition wins grant",
+        "url": "https://x.example/right",
+        "snippet": "The Baltimore organization received funding. Full text... [1200 chars]",
+        "source": "Baltimore Banner",
+        "published": "2026-04-02",
+    }]
+    assert len(profile_mod.find_press(HARBOR, search)) == 1
+
+
+def test_gnews_key_selects_the_gnews_provider(monkeypatch):
+    monkeypatch.delenv("GRANTSIGHT_NEWS_URL", raising=False)
+    monkeypatch.delenv("GNEWS_API_KEY", raising=False)
+    assert profile_mod._provider_from_env() is None
+    monkeypatch.setenv("GNEWS_API_KEY", "k")
+    assert profile_mod._provider_from_env() is not None
+
+
 def test_press_search_failure_is_not_fatal():
     def broken(query):
         raise RuntimeError("provider down")

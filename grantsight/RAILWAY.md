@@ -84,7 +84,8 @@ Optional:
 | `GRANTSIGHT_REFRESH_DAYS` | Rebuild window, default 30 |
 | `GRANTSIGHT_AUTO_BUILD=0` | Disable the background build and run it by hand |
 | `WEB_CONCURRENCY` | Uvicorn workers, default 2 |
-| `GRANTSIGHT_NEWS=1` + `GRANTSIGHT_NEWS_URL` | Press mentions; off by default |
+| `GRANTSIGHT_NEWS=1` + `GNEWS_API_KEY` | Press mentions via GNews; off by default |
+| `GRANTSIGHT_NEWS=1` + `GRANTSIGHT_NEWS_URL` | Press mentions via a generic search API template |
 
 Do not set `PORT`. Railway injects it and the entrypoint reads it.
 

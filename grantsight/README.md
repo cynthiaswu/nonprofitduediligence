@@ -191,8 +191,10 @@ stop anyone believing it.
 Press items are context only. They cannot raise a brief's severity, they never
 become findings, and no article is summarized beyond its own headline.
 
-Enable with `GRANTSIGHT_NEWS=1` plus `GRANTSIGHT_NEWS_URL` (a template
-containing `{query}`), or pass a `search` callable to `brief.build()`.
+Enable with `GRANTSIGHT_NEWS=1` plus one provider: `GNEWS_API_KEY` (a
+[GNews](https://gnews.io) key; the bundled adapter) or `GRANTSIGHT_NEWS_URL`
+(a generic JSON search API template containing `{query}`), or pass a `search`
+callable to `brief.build()`.
 
 ## Picking this up cold
 
