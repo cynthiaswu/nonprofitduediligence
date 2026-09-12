@@ -1298,12 +1298,73 @@ def test_gnews_provider_maps_articles_and_sends_only_the_quoted_name(monkeypatch
     assert len(profile_mod.find_press(HARBOR, search)) == 1
 
 
-def test_gnews_key_selects_the_gnews_provider(monkeypatch):
+def test_provider_selection(monkeypatch):
     monkeypatch.delenv("GRANTSIGHT_NEWS_URL", raising=False)
     monkeypatch.delenv("GNEWS_API_KEY", raising=False)
-    assert profile_mod._provider_from_env() is None
+    monkeypatch.delenv("GRANTSIGHT_NEWS_PROVIDER", raising=False)
+    assert profile_mod._provider_from_env(HARBOR) is not None, "GDELT needs no key"
+    monkeypatch.setenv("GRANTSIGHT_NEWS_PROVIDER", "gnews")
+    assert profile_mod._provider_from_env(HARBOR) is None
     monkeypatch.setenv("GNEWS_API_KEY", "k")
-    assert profile_mod._provider_from_env() is not None
+    assert profile_mod._provider_from_env(HARBOR) is not None
+    monkeypatch.setenv("GRANTSIGHT_NEWS_PROVIDER", "url")
+    assert profile_mod._provider_from_env(HARBOR) is None
+    monkeypatch.setenv("GRANTSIGHT_NEWS_URL", "https://s.example/?q={query}")
+    assert profile_mod._provider_from_env(HARBOR) is not None
+
+
+def test_gdelt_provider_queries_name_with_place_and_marks_the_corroboration(monkeypatch):
+    import httpx
+
+    seen = {}
+    monkeypatch.setattr(profile_mod, "GDELT_MIN_INTERVAL_S", 0.0)
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen.update(url=url, params=params)
+        return httpx.Response(200, json={"articles": [
+            {"url": "https://x.example/right", "url_mobile": "",
+             "title": "Harbor Street Youth Coalition wins grant",
+             "seendate": "20260402T140000Z", "socialimage": "",
+             "domain": "banner.example", "language": "English",
+             "sourcecountry": "United States"},
+            "not-a-dict",
+        ]}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    search = profile_mod.gdelt_provider(org=HARBOR)
+    items = list(search(profile_mod.build_query(HARBOR)))
+
+    assert seen["url"] == profile_mod.GDELT_ENDPOINT
+    assert seen["params"]["query"] == (
+        f'"{HARBOR["name"]}" ("Baltimore" OR "Maryland") sourcelang:english')
+    assert seen["params"]["mode"] == "artlist" and seen["params"]["format"] == "json"
+    assert items == [{
+        "title": "Harbor Street Youth Coalition wins grant",
+        "url": "https://x.example/right",
+        "snippet": None,
+        "source": "banner.example",
+        "published": "2026-04-02",
+        "corroborated_by": ["full-text match (Baltimore or Maryland)"],
+    }]
+    press = profile_mod.find_press(HARBOR, search)
+    assert len(press) == 1
+    assert press[0].corroborated_by == ["full-text match (Baltimore or Maryland)"]
+
+
+def test_gdelt_empty_body_and_title_only_results_without_place_do_not_confirm(monkeypatch):
+    """GDELT answers an empty body for no matches; and a title-only result
+    that GDELT did not filter by place is still held to the normal rule."""
+    import httpx
+
+    monkeypatch.setattr(profile_mod, "GDELT_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: httpx.Response(
+        200, text="", request=httpx.Request("GET", url)))
+    assert list(profile_mod.gdelt_provider(org=HARBOR)("q")) == []
+
+    no_place = {"title": "Harbor Street Youth Coalition wins grant",
+                "url": "https://x.example/x", "corroborated_by": []}
+    ok, _ = profile_mod.confirm_identity(no_place, HARBOR)
+    assert not ok
 
 
 def test_press_search_failure_is_not_fatal():

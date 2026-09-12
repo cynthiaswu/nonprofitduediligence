@@ -191,9 +191,14 @@ stop anyone believing it.
 Press items are context only. They cannot raise a brief's severity, they never
 become findings, and no article is summarized beyond its own headline.
 
-Enable with `GRANTSIGHT_NEWS=1` plus one provider: `GNEWS_API_KEY` (a
-[GNews](https://gnews.io) key; the bundled adapter) or `GRANTSIGHT_NEWS_URL`
-(a generic JSON search API template containing `{query}`), or pass a `search`
+Enable with `GRANTSIGHT_NEWS=1`. The default provider is the
+[GDELT DOC 2.0 API](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/):
+free, no key, one request per 5 seconds. GDELT returns headlines without
+excerpts, so the adapter asks it for articles whose full text contains the
+quoted name and the organization's city or state, and records that full-text
+match as the corroborator. Set `GRANTSIGHT_NEWS_PROVIDER=gnews` (with
+`GNEWS_API_KEY`) or `=url` (with `GRANTSIGHT_NEWS_URL`, a JSON search API
+template containing `{query}`) to use another source, or pass a `search`
 callable to `brief.build()`.
 
 ## Picking this up cold
