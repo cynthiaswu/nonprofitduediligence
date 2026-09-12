@@ -118,23 +118,29 @@ This is the reason to be on Railway rather than a static host, so it is worth
 doing properly. It needs two pieces.
 
 **The EIN index.** The IRS publishes a per-year index CSV listing every
-electronic filing with its object id, at
-`apps.irs.gov/pub/epostcard/990/xml/{year}/`. Set:
+electronic filing with its object id and batch zip, at
+`apps.irs.gov/pub/epostcard/990/xml/{year}/index_{year}.csv`. The directory
+year must match the filename year (`.../2024/index_2025.csv` is a 404). Years
+are *filing* years: an FY2024 return filed in 2025 is in `index_2025.csv`. Set:
 
 ```
-GRANTSIGHT_XML_INDEX_URLS=<index-2024-url> <index-2023-url>
+GRANTSIGHT_XML_INDEX_URLS=https://apps.irs.gov/pub/epostcard/990/xml/2026/index_2026.csv https://apps.irs.gov/pub/epostcard/990/xml/2025/index_2025.csv https://apps.irs.gov/pub/epostcard/990/xml/2024/index_2024.csv
 ```
 
 The entrypoint builds `xml_index.sqlite3` from these on first boot. Roughly
-50 MB per year.
+50-100 MB per year. A URL that fails is reported and skipped; the build only
+fails if nothing loads.
 
 **The filings themselves.** Two options:
 
-*Per-object fetch (recommended on a 5 GB volume).* `GRANTSIGHT_XML_OBJECT_URL`
-already defaults to the per-object pattern, so once the index exists, each
-brief fetches just the XML it needs and caches it. Nothing else to configure.
-First view of an organization is a second or two slower; afterwards it is
-cached.
+*Batch-zip fetch (default; fine on a 5 GB volume).* The IRS ships filings in
+yearly batch zips of 70-500 MB. Once the index exists, each brief locates its
+filing's zip, reads the zip directory with HTTP range requests, then fetches
+and decompresses just that one member (~100-300 KB). The directory is cached
+in `xml_batches.sqlite3` and the XML in `xml-cache/`, so nothing is fetched
+twice. First view of an organization is a few seconds slower; afterwards it
+is cached. Set `GRANTSIGHT_XML_OBJECT_URL` (a `{object_id}` template) instead
+if you mirror the corpus somewhere yourself.
 
 *Local corpus.* If you want no per-request fetch, download the yearly zips,
 extract them, and upload to the volume:

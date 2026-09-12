@@ -7,8 +7,11 @@ as a finding against the organization.
 
 from __future__ import annotations
 
+import io
 import json
+import random
 import sys
+import zipfile
 from datetime import date
 from pathlib import Path
 
@@ -873,6 +876,179 @@ def test_xml_failure_degrades_to_a_stated_error(monkeypatch):
     result = brief_mod.build("52-1693387")
     assert result.xml is None
     assert any("XML unavailable" in err for err in result.errors)
+
+
+def test_filer_name_wins_over_preparer_firm_name():
+    """The preparer firm's BusinessName comes first in the return header."""
+    xml = (
+        '<Return xmlns="http://www.irs.gov/efile"><ReturnHeader>'
+        "<PreparerFirmGrp><PreparerFirmEIN>814234542</PreparerFirmEIN>"
+        "<PreparerFirmName><BusinessNameLine1Txt>BPM LLP</BusinessNameLine1Txt>"
+        "</PreparerFirmName></PreparerFirmGrp>"
+        "<Filer><EIN>510187791</EIN><BusinessName>"
+        "<BusinessNameLine1Txt>MISSION ECONOMIC DEVELOPMENT AGENCY</BusinessNameLine1Txt>"
+        "</BusinessName></Filer></ReturnHeader><ReturnData><IRS990/></ReturnData></Return>"
+    )
+    parsed = xml990.parse(xml)
+    assert parsed.name == "MISSION ECONOMIC DEVELOPMENT AGENCY"
+    assert parsed.ein == "510187791"
+
+
+# --- index build and batch-zip retrieval ------------------------------------
+
+INDEX_HEADER = "RETURN_ID,FILING_TYPE,EIN,TAX_PERIOD,SUB_DATE,TAXPAYER_NAME,RETURN_TYPE,DLN,OBJECT_ID,XML_BATCH_ID\n"
+
+
+def _xml_paths(monkeypatch, tmp_path):
+    monkeypatch.setattr(xml990, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(xml990, "XML_DB", tmp_path / "xml_index.sqlite3")
+    monkeypatch.setattr(xml990, "BATCH_DB", tmp_path / "xml_batches.sqlite3")
+    monkeypatch.setattr(xml990, "XML_CORPUS", tmp_path / "corpus")
+    monkeypatch.setattr(xml990, "XML_CACHE", tmp_path / "cache")
+    monkeypatch.setattr(xml990, "OBJECT_URL", None)
+
+
+def test_build_index_keeps_batch_id_and_takes_several_sources(monkeypatch, tmp_path):
+    _xml_paths(monkeypatch, tmp_path)
+    a = tmp_path / "index_2025.csv"
+    a.write_text(INDEX_HEADER
+                 + "1,EFILE,510187791,202412,2025-05-01,MEDA,990,x,202513219349325391,2025_TEOS_XML_11D\n"
+                 + "2,EFILE,510187791,202412,2025-03-01,MEDA,990T,x,202503219339305105,2025_TEOS_XML_11A\n")
+    b = tmp_path / "index_2024.csv"
+    b.write_text(INDEX_HEADER
+                 + "3,EFILE,510187791,202312,2024-11-01,MEDA,990,x,202443209349328364,2024_TEOS_XML_11A\n")
+    monkeypatch.setattr(xml990, "get_bytes",
+                        lambda url, dest, **kw: (_ for _ in ()).throw(
+                            xml990.FetchError(f"{url}: 404")))
+
+    result = xml990.build_index([str(a), "https://apps.irs.gov/wrong/2024/index_2025.csv", str(b)])
+    assert result["rows"] == 3, "a bad URL is skipped, not fatal"
+
+    filings = xml990.indexed_filings("51-0187791")
+    assert [f.object_id for f in filings] == [
+        "202513219349325391", "202443209349328364", "202503219339305105"]
+    assert filings[0].batch == "2025_TEOS_XML_11D"
+    assert filings[0].form_type == "990"
+    # 990-T carries no Part VII / Part IX content, so it sorts last even
+    # though it is the same tax year as the 990.
+    assert filings[-1].form_type == "990T"
+
+
+def test_build_index_with_nothing_loaded_writes_no_db(monkeypatch, tmp_path):
+    _xml_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(xml990, "get_bytes",
+                        lambda url, dest, **kw: (_ for _ in ()).throw(
+                            xml990.FetchError(f"{url}: 404")))
+    result = xml990.build_index(["https://apps.irs.gov/wrong.csv", str(tmp_path / "nope")])
+    assert result["rows"] == 0 and result["db"] is None
+    assert not xml990.XML_DB.exists()
+    assert xml990.indexed_filings("510187791") == []
+
+
+def _fake_remote(monkeypatch, blob: bytes):
+    """Serve `blob` through the two HTTP primitives the zip reader uses."""
+    calls = []
+
+    def head(url):
+        return len(blob)
+
+    def rng(url, start, end):
+        calls.append((start, end))
+        return blob[start:end + 1]
+
+    monkeypatch.setattr(xml990, "content_length", head)
+    monkeypatch.setattr(xml990, "get_range", rng)
+    return calls
+
+
+def _batch_zip(members: dict[str, bytes], force_zip64=False, stored=False) -> bytes:
+    buf = io.BytesIO()
+    method = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(buf, "w", method) as zf:
+        for name, data in members.items():
+            info = zipfile.ZipInfo(name)
+            info.compress_type = method
+            with zf.open(info, "w", force_zip64=force_zip64) as handle:
+                handle.write(data)
+    return buf.getvalue()
+
+
+SAMPLE_XML = (XML_DIR / "sample_990.xml").read_bytes()
+
+
+def test_remote_zip_member_reads_only_directory_and_target(monkeypatch, tmp_path):
+    _xml_paths(monkeypatch, tmp_path)
+    blob = _batch_zip({
+        # Incompressible padding so the zip is well past the 64 KiB tail read.
+        "111_public.xml": random.Random(7).randbytes(300_000),
+        "202513219349325391_public.xml": SAMPLE_XML,
+        "333_public.xml": b"<x/>" * 2000,
+    })
+    calls = _fake_remote(monkeypatch, blob)
+
+    data = xml990._remote_zip_member("https://irs/2025_TEOS_XML_11D.zip",
+                                     "2025_TEOS_XML_11D", "202513219349325391_public.xml")
+    assert data == SAMPLE_XML
+    fetched = sum(end - start + 1 for start, end in calls)
+    assert fetched < len(blob), "the whole batch zip must not be downloaded"
+
+    # Second member from the same batch uses the cached directory: no tail read.
+    calls.clear()
+    assert xml990._remote_zip_member("https://irs/2025_TEOS_XML_11D.zip",
+                                     "2025_TEOS_XML_11D", "333_public.xml") == b"<x/>" * 2000
+    assert all(start > 0 for start, _ in calls)
+    assert len(calls) == 2  # local header + compressed data
+
+    assert xml990._remote_zip_member("https://irs/2025_TEOS_XML_11D.zip",
+                                     "2025_TEOS_XML_11D", "missing.xml") is None
+
+
+def test_remote_zip_member_handles_zip64_and_stored(monkeypatch, tmp_path):
+    _xml_paths(monkeypatch, tmp_path)
+    blob = _batch_zip({"a_public.xml": SAMPLE_XML, "b_public.xml": b"<b/>"},
+                      force_zip64=True, stored=True)
+    _fake_remote(monkeypatch, blob)
+    assert xml990._remote_zip_member("https://irs/z.zip", "z", "a_public.xml") == SAMPLE_XML
+    assert xml990._remote_zip_member("https://irs/z.zip", "z", "b_public.xml") == b"<b/>"
+
+
+def test_load_for_pulls_filing_from_irs_batch_zip_and_caches_it(monkeypatch, tmp_path):
+    _xml_paths(monkeypatch, tmp_path)
+    idx = tmp_path / "index_2025.csv"
+    idx.write_text(INDEX_HEADER
+                   + "1,EFILE,521693387,202312,2025-05-01,HARBOR,990,x,2025A,2025_TEOS_XML_11D\n")
+    xml990.build_index([str(idx)])
+    blob = _batch_zip({"2025A_public.xml": SAMPLE_XML})
+    urls = []
+
+    def head(url):
+        urls.append(url)
+        return len(blob)
+
+    monkeypatch.setattr(xml990, "content_length", head)
+    monkeypatch.setattr(xml990, "get_range", lambda url, s, e: blob[s:e + 1])
+
+    parsed = xml990.load_for("52-1693387")
+    assert parsed is not None and parsed.expenses.complete
+    assert parsed.people[0].name == "Dana Whitfield"
+    assert urls == ["https://apps.irs.gov/pub/epostcard/990/xml/2025/2025_TEOS_XML_11D.zip"]
+    assert (xml990.XML_CACHE / "2025A.xml").read_bytes() == SAMPLE_XML
+
+    # Cached: the network is not consulted again.
+    monkeypatch.setattr(xml990, "get_range",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("network used")))
+    assert xml990.load_for("521693387").name == parsed.name
+
+
+def test_load_for_is_none_when_batch_is_unreachable(monkeypatch, tmp_path):
+    _xml_paths(monkeypatch, tmp_path)
+    idx = tmp_path / "index_2025.csv"
+    idx.write_text(INDEX_HEADER
+                   + "1,EFILE,521693387,202312,2025-05-01,HARBOR,990,x,2025A,2025_TEOS_XML_11D\n")
+    xml990.build_index([str(idx)])
+    monkeypatch.setattr(xml990, "content_length",
+                        lambda url: (_ for _ in ()).throw(xml990.FetchError("503")))
+    assert xml990.load_for("521693387") is None
 
 
 # ---------------------------------------------------------------------------

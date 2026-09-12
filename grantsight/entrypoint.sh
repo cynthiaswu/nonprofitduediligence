@@ -60,6 +60,11 @@ build_if_needed() {
   fi
 
   if [ -n "$GRANTSIGHT_XML_INDEX_URLS" ]; then
+    # An index from before the batch column was added cannot locate filings.
+    if [ -f "$DATA/xml_index.sqlite3" ] && ! python -m diligence.xml990 --check-index; then
+      echo "[grantsight] XML index is from an older schema; rebuilding."
+      rm -f "$DATA/xml_index.sqlite3"
+    fi
     if [ ! -f "$DATA/xml_index.sqlite3" ]; then
       echo "[grantsight] building Form 990 XML index..."
       # shellcheck disable=SC2086

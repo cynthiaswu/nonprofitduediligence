@@ -81,6 +81,38 @@ def get_json(url: str, ttl_s: int = DEFAULT_TTL_S) -> Any:
     raise FetchError(f"{url}: {last_error}")
 
 
+def content_length(url: str) -> int:
+    """Size of a remote file, from a HEAD request."""
+    _throttle()
+    try:
+        response = httpx.head(
+            url, headers={"User-Agent": _contact()}, timeout=30.0, follow_redirects=True
+        )
+        response.raise_for_status()
+        return int(response.headers["content-length"])
+    except Exception as exc:  # noqa: BLE001
+        raise FetchError(f"{url}: {exc}") from exc
+
+
+def get_range(url: str, start: int, end: int) -> bytes:
+    """Bytes [start, end] of a remote file via an HTTP Range request."""
+    _throttle()
+    try:
+        response = httpx.get(
+            url,
+            headers={"User-Agent": _contact(), "Range": f"bytes={start}-{end}"},
+            timeout=120.0,
+            follow_redirects=True,
+        )
+        if response.status_code != 206:
+            raise FetchError(f"{url}: range request returned HTTP {response.status_code}")
+        return response.content
+    except FetchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise FetchError(f"{url}: {exc}") from exc
+
+
 def get_bytes(url: str, dest: Path, ttl_s: int = DEFAULT_TTL_S) -> Path:
     """Download a large file (IRS bulk zips) to `dest`, refreshing on TTL."""
     if dest.exists() and (time.time() - dest.stat().st_mtime) < ttl_s:
