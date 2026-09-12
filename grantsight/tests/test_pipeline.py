@@ -201,12 +201,19 @@ def test_date_layout_labels_unrecognized_input():
     assert irs_status.date_layout("") is None
 
 
+def _offline_irs(tmp_path, monkeypatch):
+    """Point irs_status at a temp dir and make every download fail."""
+    monkeypatch.setattr(irs_status, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(irs_status, "DB_PATH", tmp_path / "irs.sqlite3")
+    monkeypatch.setattr(irs_status, "_fetch", lambda key, url, local: local)
+    monkeypatch.setattr(irs_status, "discover_urls", lambda: {})
+
+
 def _build_tiny_index(tmp_path, rows, monkeypatch):
     """Index a handful of rows in a temp dir and return the module."""
     src = tmp_path / "data-download-revocation.txt"
     src.write_text("\n".join(rows), encoding="latin-1")
-    monkeypatch.setattr(irs_status, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(irs_status, "DB_PATH", tmp_path / "irs.sqlite3")
+    _offline_irs(tmp_path, monkeypatch)
     irs_status.build_index({"revocation": src})
     return irs_status
 
@@ -240,13 +247,37 @@ def test_unparseable_date_reports_unknown_not_clear(tmp_path, monkeypatch):
 
 def test_empty_revocation_table_reports_unknown(tmp_path, monkeypatch):
     """A failed download must not make every organization look clean."""
-    monkeypatch.setattr(irs_status, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(irs_status, "DB_PATH", tmp_path / "irs.sqlite3")
+    _offline_irs(tmp_path, monkeypatch)
     report = irs_status.build_index({})
     assert report["counts"].get("revocation", 0) == 0
     result = irs_status.check("521693387")
     assert result.state == irs_status.UNKNOWN
     assert "empty" in result.detail.lower()
+
+
+def test_double_quotes_in_names_do_not_swallow_following_rows(tmp_path, monkeypatch):
+    """The live e-Postcard file has `"` inside names. Default csv quoting
+    treats one as an opening quote and merges every following row into a
+    single field until the limit blows -- the build crashed and the revoked
+    organizations after it were never indexed."""
+    rows = [
+        '111111111|PONTIAN SOCIETY "PANAGIA SOUMELA" INC|D|1 ST|X|MA|02118|US|03|05/15/2024|08/12/2024|',
+        "222222222|PLAIN ORG|D|1 ST|X|MD|21230|US|03|05/15/2024|08/12/2024|",
+    ]
+    s = _build_tiny_index(tmp_path, rows, monkeypatch)
+    assert s.check("111111111").state == s.REVOKED
+    assert s.check("222222222").state == s.REVOKED
+
+    epostcard = tmp_path / "data-download-epostcard.txt"
+    epostcard.write_text(
+        '333333333|2021|ORG|T|F|01-01-2021|12-31-2021|ORG "NICK" INC|X|1 ST\n'
+        "444444444|2022|ORG|T|F|01-01-2022|12-31-2022||X|1 ST\n",
+        encoding="latin-1",
+    )
+    report = s.build_index({"revocation": tmp_path / "data-download-revocation.txt",
+                            "epostcard": epostcard})
+    assert report["counts"]["epostcard"] == 2
+    assert s.check("444444444").epostcard_years == [2022]
 
 
 def test_missing_index_reports_unknown(tmp_path, monkeypatch):
@@ -1073,3 +1104,164 @@ def test_query_is_scoped_to_the_organization():
     assert '"HARBOR STREET YOUTH COALITION"' in query
     assert "Baltimore" in query and "MD" in query
 
+
+
+# ---------------------------------------------------------------------------
+# Peer build diagnostics. A population of 0 used to report only "too small",
+# which says nothing about which of the two sources failed.
+# ---------------------------------------------------------------------------
+
+def test_zip_member_without_a_known_extension_is_still_read(tmp_path):
+    """IRS SOI extracts have shipped as .dat, .dat.dat and with no extension."""
+    import sqlite3 as _sqlite3
+    import zipfile as _zip
+
+    from diligence import peers
+
+    inner = tmp_path / "extract990"          # no extension at all
+    inner.write_text("\n".join(
+        ["elf EIN tax_pd totrevenue"]
+        + [f"E {100000000 + i} 202312 {5000 * (i + 1)}" for i in range(40)]
+    ))
+    archive = tmp_path / "soi.zip"
+    with _zip.ZipFile(archive, "w") as z:
+        z.write(inner, "extract990")
+
+    conn = _sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE soi (ein TEXT PRIMARY KEY, revenue REAL, fiscal_year INTEGER)")
+    assert peers._load_soi(conn, archive) == 40
+
+
+def test_an_html_error_page_is_not_treated_as_data(tmp_path, monkeypatch):
+    """A wrong URL often returns a 200 HTML page, which must not load as rows."""
+    from diligence import peers
+
+    fake = tmp_path / "fake.bin"
+    fake.write_bytes(b"<!DOCTYPE html><html><body>Page not found</body></html>")
+    monkeypatch.setattr(peers, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(peers, "get_bytes", lambda url, dest, **kw: fake)
+    assert peers._resolve_source("https://example.invalid/x.zip", "soi") is None
+
+
+def test_directory_or_empty_source_is_reported_not_raised(tmp_path, monkeypatch, capsys):
+    from diligence import peers
+
+    monkeypatch.setattr(peers, "DATA_DIR", tmp_path)
+    assert peers._resolve_source(str(tmp_path), "soi") is None
+    assert peers._resolve_source("", "soi") is None
+    assert peers._resolve_source(str(tmp_path / "missing.zip"), "soi") is None
+    err = capsys.readouterr().err
+    assert "is a directory" in err and "empty --soi" in err and "does not exist" in err
+
+
+def test_empty_join_names_which_source_failed(tmp_path, monkeypatch):
+    from diligence import peers
+
+    bmf = tmp_path / "bmf.csv"
+    bmf.write_text("EIN,NAME,STATE,NTEE_CD\n"
+                   + "\n".join(f"{100000000 + i},ORG,MD,O20" for i in range(40)))
+    monkeypatch.setattr(peers, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(peers, "DB_PATH", tmp_path / "peers.sqlite3")
+
+    report = peers.build_index([], [str(bmf)])
+    assert report["bmf"] == 40
+    assert report["soi"] == 0
+    assert report["joined"] == 0
+    problem = " ".join(report["problems"])
+    assert "SOI extract loaded 0 rows" in problem
+    assert "--soi URL" in problem
+
+
+def test_non_overlapping_eins_are_distinguished_from_a_failed_download(tmp_path, monkeypatch):
+    """Both files fine but no shared EINs is a different problem, worded differently."""
+    from diligence import peers
+
+    soi = tmp_path / "soi.dat"
+    soi.write_text("\n".join(["elf EIN tax_pd totrevenue"]
+                             + [f"E {100000000 + i} 202312 5000" for i in range(40)]))
+    bmf = tmp_path / "bmf.csv"
+    bmf.write_text("EIN,NAME,STATE,NTEE_CD\n"
+                   + "\n".join(f"{900000000 + i},ORG,MD,O20" for i in range(40)))
+    monkeypatch.setattr(peers, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(peers, "DB_PATH", tmp_path / "peers.sqlite3")
+
+    report = peers.build_index([str(soi)], [str(bmf)])
+    assert report["soi"] == 40 and report["bmf"] == 40 and report["joined"] == 0
+    assert "no EINs matched" in " ".join(report["problems"])
+
+
+# ---------------------------------------------------------------------------
+# SOI delimiter handling. Pre-2018 extracts are space-delimited ASCII; the
+# 2018+ files are CSV. Assuming one format parsed the other to zero rows and
+# reported it as "population too small", which pointed nowhere useful.
+# ---------------------------------------------------------------------------
+
+def _load_soi_text(tmp_path, name, body):
+    import sqlite3 as _sqlite3
+
+    from diligence import peers
+    path = tmp_path / name
+    path.write_text(body)
+    conn = _sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE soi (ein TEXT PRIMARY KEY, revenue REAL, fiscal_year INTEGER)")
+    count = peers._load_soi(conn, path)
+    rows = conn.execute("SELECT ein, revenue, fiscal_year FROM soi ORDER BY ein").fetchall()
+    return count, rows
+
+
+def test_space_delimited_extract_loads():
+    from diligence import peers
+    assert peers._sniff_delimiter("elf EIN tax_pd totrevenue") == peers.WHITESPACE
+
+
+def test_comma_delimited_extract_loads():
+    from diligence import peers
+    assert peers._sniff_delimiter("elf,EIN,tax_pd,totrevenue") == ","
+
+
+def test_whitespace_is_distinguishable_from_failure():
+    """Whitespace used to be represented as None, the same value returned for
+    'no delimiter found', so a correctly parsed header read as a failure."""
+    from diligence import peers
+    assert peers._sniff_delimiter("elf EIN tax_pd totrevenue") is not None
+    assert peers._sniff_delimiter("nothing useful here at all") is None
+
+
+def test_every_delimiter_variant_yields_the_same_rows(tmp_path):
+    variants = {
+        "space.dat": "\n".join(["elf EIN tax_pd totrevenue"]
+                               + [f"E {100000000 + i} 202312 {5000 * (i + 1)}" for i in range(30)]),
+        "comma.csv": "\n".join(["elf,EIN,tax_pd,totrevenue"]
+                               + [f"E,{100000000 + i},202312,{5000 * (i + 1)}" for i in range(30)]),
+        "quoted.csv": "\n".join(['"elf","EIN","tax_pd","totrevenue"']
+                                + [f'"E","{100000000 + i}","202312","{5000 * (i + 1)}"' for i in range(30)]),
+        "tab.txt": "\n".join(["elf\tEIN\ttax_pd\ttotrevenue"]
+                             + [f"E\t{100000000 + i}\t202312\t{5000 * (i + 1)}" for i in range(30)]),
+    }
+    reference = None
+    for name, body in variants.items():
+        count, rows = _load_soi_text(tmp_path, name, body)
+        assert count == 30, name
+        if reference is None:
+            reference = rows
+        assert rows == reference, f"{name} parsed differently"
+
+
+def test_990pf_revenue_column_is_recognised(tmp_path):
+    """990-PF uses totrcptperbks, not totrevenue."""
+    count, rows = _load_soi_text(
+        tmp_path, "pf.csv",
+        "\n".join(["EIN,tax_pd,totrcptperbks"]
+                  + [f"{100000000 + i},202312,{9000 * (i + 1)}" for i in range(30)]),
+    )
+    assert count == 30
+    assert rows[0][1] == 9000.0
+
+
+def test_unrecognisable_header_reports_what_it_saw(tmp_path, capsys):
+    count, _ = _load_soi_text(
+        tmp_path, "wrong.csv", "alpha,beta,gamma\n1,2,3\n")
+    assert count == 0
+    err = capsys.readouterr().err
+    assert "could not find EIN" in err
+    assert "alpha,beta,gamma" in err      # shows the real header, not a guess

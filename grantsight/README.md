@@ -77,7 +77,8 @@ python -m diligence.irs_status --verify
 
 Peer percentiles need a second index, built from two files that each hold half
 of what is needed — the SOI extract has financials but no sector or state, and
-the BMF has sector and state but no financials:
+the BMF has sector and state but no financials. On Railway this is driven by
+the `GRANTSIGHT_PEERS_SOI` and `GRANTSIGHT_PEERS_BMF` variables; locally:
 
 ```bash
 python -m diligence.peers --build \
@@ -192,6 +193,13 @@ become findings, and no article is summarized beyond its own headline.
 
 Enable with `GRANTSIGHT_NEWS=1` plus `GRANTSIGHT_NEWS_URL` (a template
 containing `{query}`), or pass a `search` callable to `brief.build()`.
+
+## Picking this up cold
+
+[HANDOFF.md](HANDOFF.md) is the brief for a new contributor or a coding agent:
+verified data-source URLs, the design invariants that must not be broken, bugs
+already found and fixed, and what is genuinely impossible so nobody burns time
+on it.
 
 ## Publishing
 
