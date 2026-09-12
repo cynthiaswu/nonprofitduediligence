@@ -79,6 +79,8 @@ Optional:
 | --- | --- |
 | `ANTHROPIC_API_KEY` | Model-written summary paragraph; a deterministic template runs without it |
 | `GRANTSIGHT_XML_INDEX_URLS` | Space-separated IRS index CSVs; enables the Form 990 XML sections |
+| `GRANTSIGHT_PEERS_SOI` | Space-separated SOI extract URLs; with the next one, enables peer percentiles |
+| `GRANTSIGHT_PEERS_BMF` | Space-separated EO BMF CSV URLs |
 | `GRANTSIGHT_REFRESH_DAYS` | Rebuild window, default 30 |
 | `GRANTSIGHT_AUTO_BUILD=0` | Disable the background build and run it by hand |
 | `WEB_CONCURRENCY` | Uvicorn workers, default 2 |
@@ -153,18 +155,34 @@ recipient EINs that link through to their own briefs.
 
 ## 6. Peer percentiles
 
-Not automatic, because the two source files are large and you choose which
-year:
+Also variable-driven, so no terminal required. Add two more variables and
+redeploy:
 
-```bash
-railway ssh
-python -m diligence.peers --build \
-  --soi https://www.irs.gov/pub/irs-soi/23eofinextract990.zip \
-  --bmf https://www.irs.gov/pub/irs-soi/eo1.csv \
-  --bmf https://www.irs.gov/pub/irs-soi/eo2.csv
+```
+GRANTSIGHT_PEERS_SOI=https://www.irs.gov/pub/irs-soi/23eofinextract990.zip
+GRANTSIGHT_PEERS_BMF=https://www.irs.gov/pub/irs-soi/eo1.csv https://www.irs.gov/pub/irs-soi/eo2.csv https://www.irs.gov/pub/irs-soi/eo3.csv https://www.irs.gov/pub/irs-soi/eo4.csv
 ```
 
-Until then the peer section simply does not render. It never estimates.
+Both accept several space-separated URLs. The two files each hold half of what
+a percentile needs and are joined on EIN: the SOI extract has financials but no
+sector or state, and the Business Master File has sector and state but no
+financials. The four `eo*.csv` files are the IRS regional splits of the BMF —
+load all four for national coverage, or just the regions you fund in.
+
+Check the logs for:
+
+```
+[grantsight] building peer percentile index...
+[grantsight] peer index ready.
+```
+
+Until this runs the peer section simply does not render. It never estimates
+from a partial population, so a failed build shows as an absent section rather
+than a wrong number.
+
+To rebuild later — a newer SOI year, or more BMF regions — delete
+`peers.sqlite3` from the volume first, since the entrypoint skips the build
+when the file already exists.
 
 ---
 

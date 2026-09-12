@@ -163,12 +163,23 @@ def compare(organization: dict, revenue: float | None) -> PeerContext | None:
 # build
 # ---------------------------------------------------------------------------
 def _text_members(path: Path):
+    """Yield text streams for a zip's data members, or the file itself.
+
+    IRS file naming is inconsistent -- the SOI extracts have shipped as .dat,
+    .dat.dat and with no extension at all -- so an extension filter that finds
+    nothing falls back to every member rather than silently loading zero rows.
+    """
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
-            for name in archive.namelist():
-                if name.lower().endswith((".dat", ".csv", ".txt")):
-                    with archive.open(name) as handle:
-                        yield io.TextIOWrapper(handle, encoding="latin-1", errors="replace")
+            names = [n for n in archive.namelist() if not n.endswith("/")]
+            wanted = [n for n in names if n.lower().endswith((".dat", ".csv", ".txt"))]
+            if not wanted and names:
+                print(f"  note: no .dat/.csv/.txt member in {path.name}; "
+                      f"reading {names}", file=sys.stderr)
+                wanted = names
+            for name in wanted:
+                with archive.open(name) as handle:
+                    yield io.TextIOWrapper(handle, encoding="latin-1", errors="replace")
     else:
         with path.open(encoding="latin-1", errors="replace") as handle:
             yield handle
@@ -177,37 +188,84 @@ def _text_members(path: Path):
 def _resolve_source(source: str, label: str) -> Path | None:
     if source.startswith("http"):
         try:
-            return get_bytes(source, DATA_DIR / f"{label}-{abs(hash(source)) % 99999}.bin")
+            path = get_bytes(source, DATA_DIR / f"{label}-{abs(hash(source)) % 99999}.bin")
         except FetchError as exc:
-            print(f"  ! {source}: {exc}", file=sys.stderr)
+            print(f"\n  !! DOWNLOAD FAILED: {source}\n     {exc}\n"
+                  f"     Check the URL opens in a browser. IRS filenames change "
+                  f"between years.\n", file=sys.stderr)
             return None
+        # A 404 page served as HTML is still a successful HTTP fetch.
+        head = path.open("rb").read(200).lstrip().lower()
+        if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
+            print(f"\n  !! {source}\n     returned an HTML page, not data. The URL "
+                  f"is probably wrong.\n", file=sys.stderr)
+            return None
+        return path
+    if not source.strip():
+        print(f"  ! empty --{label} argument", file=sys.stderr)
+        return None
     path = Path(source)
-    if not path.exists():
-        print(f"  ! {path} does not exist", file=sys.stderr)
+    if not path.is_file():
+        what = "is a directory, not a file" if path.is_dir() else "does not exist"
+        print(f"  ! {path} {what}", file=sys.stderr)
         return None
     return path
 
 
+# Whitespace is a real choice, so it needs its own value: returning None for
+# "split on whitespace" collided with None meaning "no delimiter found", and
+# the space-delimited path silently reported failure on a header it had
+# actually parsed correctly.
+WHITESPACE = " "
+
+
+def _split(line: str, delimiter: str) -> list[str]:
+    if delimiter == WHITESPACE:
+        return line.split()
+    return [cell.strip().strip('"') for cell in line.split(delimiter)]
+
+
+def _sniff_delimiter(header: str) -> str | None:
+    """SOI extracts changed format: pre-2018 files are space-delimited ASCII,
+    later ones are CSV. Pick whichever splitter yields a usable header rather
+    than assuming, because guessing wrong parses every row to nothing.
+
+    Returns the delimiter, or None when no candidate produces a usable header.
+    """
+    for delimiter in (",", "\t", WHITESPACE):
+        names = [cell.lower() for cell in _split(header, delimiter)]
+        if "ein" in names and any(key in names for key in REVENUE_KEYS):
+            return delimiter
+    return None
+
+
+DELIMITER_NAMES = {",": "comma", "\t": "tab", WHITESPACE: "space"}
+
+
 def _load_soi(conn: sqlite3.Connection, path: Path) -> int:
-    """SOI extracts are space-delimited ASCII with a header row of names."""
+    """Load EIN and total revenue, whatever delimiter the year happens to use."""
     loaded = 0
     for stream in _text_members(path):
         header = stream.readline().strip()
-        names = [n.strip() for n in header.split()]
-        if not names:
+        delimiter = _sniff_delimiter(header)
+        if delimiter is None:
+            preview = header[:200]
+            print(f"\n  !! {path.name}: could not find EIN and a revenue column "
+                  f"in the header.\n     Header begins: {preview}\n"
+                  f"     Expected one of {REVENUE_KEYS}.\n", file=sys.stderr)
             continue
+
+        names = _split(header, delimiter)
         lower = {n.lower(): i for i, n in enumerate(names)}
         ein_idx = lower.get("ein")
         rev_idx = next((lower[k] for k in REVENUE_KEYS if k in lower), None)
         year_idx = lower.get("tax_pd") or lower.get("tax_prd")
-        if ein_idx is None or rev_idx is None:
-            print(f"  ! no EIN/revenue column in {path.name}; saw {names[:8]}",
-                  file=sys.stderr)
-            continue
+        print(f"  {path.name}: {len(names)} columns, "
+              f"{DELIMITER_NAMES[delimiter]}-delimited")
 
         batch = []
         for line in stream:
-            cells = line.split()
+            cells = _split(line, delimiter)
             if len(cells) <= max(ein_idx, rev_idx):
                 continue
             ein = "".join(c for c in cells[ein_idx] if c.isdigit()).zfill(9)
@@ -302,12 +360,16 @@ def build_index(soi_sources: list[str], bmf_sources: list[str]) -> dict:
             count = _load_soi(conn, path)
             report["soi"] += count
             print(f"  SOI {Path(source).name}: {count:,} rows")
+            if count == 0:
+                report["problems"].append(f"SOI source loaded 0 rows: {source}")
     for source in bmf_sources:
         path = _resolve_source(source, "bmf")
         if path:
             count = _load_bmf(conn, path)
             report["bmf"] += count
             print(f"  BMF {Path(source).name}: {count:,} rows")
+            if count == 0:
+                report["problems"].append(f"BMF source loaded 0 rows: {source}")
 
     conn.execute(
         """
@@ -322,9 +384,19 @@ def build_index(soi_sources: list[str], bmf_sources: list[str]) -> dict:
     report["joined"] = conn.execute("SELECT COUNT(*) c FROM peer_orgs").fetchone()[0]
 
     if report["joined"] == 0:
-        report["problems"].append(
-            "join produced no rows; the SOI and BMF files may not overlap"
-        )
+        if report["soi"] == 0 and report["bmf"] == 0:
+            cause = "neither source loaded. Both URLs failed or were unreadable."
+        elif report["soi"] == 0:
+            cause = ("the SOI extract loaded 0 rows, so there are no financials "
+                     "to join. Check the --soi URL.")
+        elif report["bmf"] == 0:
+            cause = ("the BMF loaded 0 rows, so there is no sector or state to "
+                     "join to. Check the --bmf URLs.")
+        else:
+            cause = (f"both sources loaded ({report['soi']:,} SOI, "
+                     f"{report['bmf']:,} BMF) but no EINs matched between them.")
+        report["problems"].append(f"join produced no rows: {cause}")
+        print(f"\n  !! JOIN PRODUCED NO ROWS: {cause}", file=sys.stderr)
     conn.execute(
         "INSERT INTO peer_meta VALUES (?,?,?)",
         (datetime.now().isoformat(timespec="seconds"), report["joined"],

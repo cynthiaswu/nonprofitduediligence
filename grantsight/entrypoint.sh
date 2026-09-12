@@ -38,6 +38,27 @@ build_if_needed() {
     fi
   fi
 
+  # Peer percentiles. Driven by variables rather than a shell command, because
+  # the Railway dashboard has no web terminal -- requiring `railway ssh` would
+  # mean this feature was unreachable for anyone not using the CLI.
+  if [ -n "$GRANTSIGHT_PEERS_SOI" ] && [ -n "$GRANTSIGHT_PEERS_BMF" ]; then
+    if [ ! -f "$DATA/peers.sqlite3" ]; then
+      echo "[grantsight] building peer percentile index..."
+      ARGS=""
+      for u in $GRANTSIGHT_PEERS_SOI; do ARGS="$ARGS --soi $u"; done
+      for u in $GRANTSIGHT_PEERS_BMF; do ARGS="$ARGS --bmf $u"; done
+      # shellcheck disable=SC2086
+      if python -m diligence.peers --build $ARGS; then
+        echo "[grantsight] peer index ready."
+      else
+        echo "[grantsight] peer index build failed; the peer section will not" >&2
+        echo "[grantsight] render. It never estimates from a partial population." >&2
+      fi
+    else
+      echo "[grantsight] peer index present; skipping build."
+    fi
+  fi
+
   if [ -n "$GRANTSIGHT_XML_INDEX_URLS" ]; then
     if [ ! -f "$DATA/xml_index.sqlite3" ]; then
       echo "[grantsight] building Form 990 XML index..."

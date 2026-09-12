@@ -364,8 +364,10 @@ def _members(path: Path):
 
 
 def _rows(path: Path):
+    # IRS pipe files are unquoted; a `"` inside a name is literal, and the
+    # default quoting would swallow every following row into one field.
     for _name, stream in _members(path):
-        for row in csv.reader(stream, delimiter="|"):
+        for row in csv.reader(stream, delimiter="|", quoting=csv.QUOTE_NONE):
             if row:
                 yield row
 
