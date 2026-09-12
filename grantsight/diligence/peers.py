@@ -26,6 +26,7 @@ import argparse
 import csv
 import io
 import os
+import re
 import sqlite3
 import sys
 import zipfile
@@ -113,9 +114,8 @@ def compare(organization: dict, revenue: float | None) -> PeerContext | None:
     Falls back to a national comparison when the state population is too thin
     to be meaningful, and returns None when even that is too thin.
     """
-    ntee = (organization.get("ntee_code") or "").strip()
     state = (organization.get("state") or "").strip().upper()
-    if not ntee or revenue is None:
+    if revenue is None:
         return None
 
     conn = _connect()
@@ -123,7 +123,9 @@ def compare(organization: dict, revenue: float | None) -> PeerContext | None:
         return None
 
     try:
-        group = ntee[0].upper()
+        group = _sector(conn, organization)
+        if group is None:
+            return None
         built = conn.execute("SELECT built_at FROM peer_meta LIMIT 1").fetchone()
         built_at = built["built_at"] if built else None
 
@@ -155,6 +157,43 @@ def compare(organization: dict, revenue: float | None) -> PeerContext | None:
                 built_at=built_at,
             )
         return None
+    finally:
+        conn.close()
+
+
+def _sector(conn, organization: dict) -> str | None:
+    """NTEE major group: ProPublica's code, else the IRS Business Master File."""
+    ntee = (organization.get("ntee_code") or "").strip()
+    if ntee:
+        return ntee[0].upper()
+    ein = re.sub(r"\D", "", str(organization.get("ein") or ""))
+    row = conn.execute("SELECT ntee_major FROM bmf WHERE ein = ?", (ein,)).fetchone()
+    return row["ntee_major"] if row and row["ntee_major"] else None
+
+
+def why_missing(organization: dict, revenue: float | None) -> str | None:
+    """One sentence on why no peer comparison could be made, for the gaps list."""
+    if revenue is None:
+        return None
+    conn = _connect()
+    if conn is None:
+        return (
+            "Size relative to peers. The peer population index is not built on "
+            "this server."
+        )
+    try:
+        group = _sector(conn, organization)
+        if group is None:
+            return (
+                "Size relative to peers. Neither ProPublica nor the IRS Business "
+                "Master File assigns this organization an NTEE sector code, so "
+                "there is no sector population to compare it against."
+            )
+        return (
+            f"Size relative to peers. Fewer than {MIN_POPULATION} "
+            f"{NTEE_GROUP_NAMES.get(group, 'comparable')} organizations have "
+            "financial data in the peer population, too few to compare against."
+        )
     finally:
         conn.close()
 

@@ -166,7 +166,12 @@ def build(ein: str, include_peers: bool = False, include_narrative: bool = False
 
     if include_peers and brief.filings:
         try:
-            brief.peer = peers.compare(org, brief.filings[0].get("total_revenue"))
+            revenue = brief.filings[0].get("total_revenue")
+            brief.peer = peers.compare(org, revenue)
+            if brief.peer is None:
+                reason = peers.why_missing(org, revenue)
+                if reason:
+                    brief.gaps.append(reason)
         except FetchError as exc:
             brief.errors.append(f"Peer comparison unavailable: {exc}")
 

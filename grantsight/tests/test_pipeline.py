@@ -649,6 +649,23 @@ def test_peer_comparison_needs_an_ntee_code_and_a_revenue(tmp_path, monkeypatch)
     assert peers.compare({"ntee_code": "O20", "state": "MD"}, None) is None
 
 
+def test_missing_propublica_ntee_falls_back_to_bmf_sector(tmp_path, monkeypatch):
+    peers, _ = _build_peers(tmp_path, monkeypatch)
+    result = peers.compare({"ein": "10-0000007", "ntee_code": None, "state": "NY"}, 500_000)
+    assert result is not None and result.sector == "O"
+
+
+def test_why_missing_names_the_reason(tmp_path, monkeypatch):
+    peers, _ = _build_peers(tmp_path, monkeypatch)
+    assert peers.why_missing({"ntee_code": "O20"}, None) is None
+    no_sector = peers.why_missing({"ein": "999999999", "ntee_code": ""}, 1.0)
+    assert "NTEE" in no_sector
+    thin = peers.why_missing({"ntee_code": "Z99", "state": "MD"}, 1.0)
+    assert "Fewer than" in thin
+    monkeypatch.setattr(peers, "DB_PATH", tmp_path / "absent.sqlite3")
+    assert "not built" in peers.why_missing({"ntee_code": "O20"}, 1.0)
+
+
 def test_tiny_population_is_refused_not_reported(tmp_path, monkeypatch):
     """Below the minimum, say nothing rather than quote a percentile of five."""
     peers, _ = _build_peers(tmp_path, monkeypatch, n=8)

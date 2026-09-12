@@ -610,8 +610,9 @@ if __name__ == "__main__":  # pragma: no cover - CLI
     import json
 
     parser = argparse.ArgumentParser(description="Parse Form 990 e-file XML.")
-    parser.add_argument("--build-index", action="append", default=[],
-                        help="IRS index CSV path (repeatable)")
+    parser.add_argument("--build-index", action="extend", nargs="+", default=[],
+                        metavar="INDEX_CSV",
+                        help="IRS index CSV paths or URLs (one or more; repeatable)")
     parser.add_argument("--file", type=Path, help="parse one XML file")
     parser.add_argument("--ein", help="find and parse the latest filing for an EIN")
     args = parser.parse_args()
