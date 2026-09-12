@@ -275,6 +275,12 @@ def confirm_identity(item: dict, org: dict) -> tuple[bool, list[str]]:
     if domain and domain in raw_haystack:
         corroborators.append(f"domain ({domain})")
 
+    # A provider that searched the full article text for the name AND a
+    # place term (GDELT) has corroborated what the title alone cannot show.
+    for extra in item.get("corroborated_by") or []:
+        if extra not in corroborators:
+            corroborators.append(extra)
+
     # A distinctive name needs one corroborator; a generic one needs two.
     required = 1 if len(tokens) >= 2 else 2
     return len(corroborators) >= required, corroborators
@@ -336,17 +342,15 @@ def build(brief, search: SearchFn | None = None, check_site: bool = True) -> Hig
     if check_site and h.website:
         h.website_status = check_website(h.website)
 
+    org = {
+        "name": brief.name, "city": brief.city, "state": brief.state,
+        "ein": brief.ein, "website": h.website,
+    }
     if search is None and os.environ.get("GRANTSIGHT_NEWS") == "1":
-        search = _provider_from_env()
+        search = _provider_from_env(org)
     h.press_enabled = search is not None
     if search is not None:
-        h.press = find_press(
-            {
-                "name": brief.name, "city": brief.city, "state": brief.state,
-                "ein": brief.ein, "website": h.website,
-            },
-            search,
-        )
+        h.press = find_press(org, search)
     return h
 
 
@@ -400,21 +404,104 @@ def gnews_provider(api_key: str, endpoint: str = GNEWS_ENDPOINT) -> SearchFn:
     return search
 
 
-def _provider_from_env() -> SearchFn | None:
-    """Build a provider from env, for operators who have a search API.
+GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
+GDELT_MIN_INTERVAL_S = 5.0  # GDELT rejects more than one request per 5 s per IP
+_gdelt_last_call = 0.0
 
-    GNEWS_API_KEY         use GNews; takes precedence when set
 
-    GRANTSIGHT_NEWS_URL   a URL template containing {query}
-    GRANTSIGHT_NEWS_KEY   optional, sent as Authorization: Bearer
-    GRANTSIGHT_NEWS_PATH  dotted path to the result list, default "results"
+def gdelt_provider(endpoint: str = GDELT_ENDPOINT, timespan: str = "24months",
+                   org: dict | None = None) -> SearchFn:
+    """Search adapter for the GDELT DOC 2.0 API (no key required).
+
+    GDELT returns title, url, domain and date only, no excerpt, so a title
+    alone can rarely show the city or state that confirm_identity needs. The
+    query therefore asks GDELT for articles whose full text contains the
+    quoted name AND the organization's city or state name, and each result
+    is marked as corroborated by that full-text match. Articles that name
+    the organization without any place term are not returned at all, which
+    is the conservative side to err on.
+    """
+
+    def search(query: str):
+        global _gdelt_last_call
+        import time
+
+        import httpx
+
+        from . import USER_AGENT
+
+        match = re.search(r'"([^"]+)"', query)
+        name = match.group(1) if match else query
+        places = []
+        if org:
+            if org.get("city"):
+                places.append(f'"{org["city"]}"')
+            state_name = STATE_NAMES.get((org.get("state") or "").upper(), "").strip()
+            if state_name:
+                places.append(f'"{state_name.title()}"')
+        q = f'"{name}"'
+        if len(places) > 1:
+            q += " (" + " OR ".join(places) + ")"
+        elif places:
+            q += f" {places[0]}"
+        q += " sourcelang:english"
+
+        wait = GDELT_MIN_INTERVAL_S - (time.monotonic() - _gdelt_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _gdelt_last_call = time.monotonic()
+        response = httpx.get(
+            endpoint,
+            params={"query": q, "mode": "artlist", "format": "json",
+                    "maxrecords": 25, "sort": "datedesc", "timespan": timespan},
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        if not response.text.strip():
+            return []
+        articles = response.json().get("articles") or []
+        corroborator = ("full-text match (" + " or ".join(p.strip('"') for p in places) + ")"
+                        if places else None)
+        out = []
+        for a in articles:
+            if not isinstance(a, dict):
+                continue
+            seen = a.get("seendate") or ""  # 20250912T083000Z
+            published = (f"{seen[:4]}-{seen[4:6]}-{seen[6:8]}"
+                         if len(seen) >= 8 and seen[:8].isdigit() else None)
+            out.append({
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "snippet": None,
+                "source": a.get("domain"),
+                "published": published,
+                "corroborated_by": [corroborator] if corroborator else [],
+            })
+        return out
+
+    return search
+
+
+def _provider_from_env(org: dict | None = None) -> SearchFn | None:
+    """Build a provider from env.
+
+    GRANTSIGHT_NEWS_PROVIDER  gdelt (default, no key) | gnews | url
+
+    gnews:  GNEWS_API_KEY
+    url:    GRANTSIGHT_NEWS_URL   a URL template containing {query}
+            GRANTSIGHT_NEWS_KEY   optional, sent as Authorization: Bearer
+            GRANTSIGHT_NEWS_PATH  dotted path to the result list, default "results"
 
     Generic results are read leniently: each item's title, url, snippet,
     source and published are taken from the first key that exists.
     """
-    gnews_key = os.environ.get("GNEWS_API_KEY")
-    if gnews_key:
-        return gnews_provider(gnews_key)
+    provider = (os.environ.get("GRANTSIGHT_NEWS_PROVIDER") or "gdelt").strip().lower()
+    if provider == "gnews":
+        gnews_key = os.environ.get("GNEWS_API_KEY")
+        return gnews_provider(gnews_key) if gnews_key else None
+    if provider == "gdelt":
+        return gdelt_provider(org=org)
 
     template = os.environ.get("GRANTSIGHT_NEWS_URL")
     if not template:
