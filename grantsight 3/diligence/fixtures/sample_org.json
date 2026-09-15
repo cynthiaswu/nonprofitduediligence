@@ -1,0 +1,85 @@
+{
+  "organization": {
+    "ein": 521693387,
+    "strein": "52-1693387",
+    "name": "HARBOR STREET YOUTH COALITION",
+    "sub_name": "",
+    "address": "1400 RIVERSIDE AVE",
+    "city": "BALTIMORE",
+    "state": "MD",
+    "zipcode": "21230-1104",
+    "subseccd": 3,
+    "ntee_code": "O20",
+    "raw_ntee_code": "O20",
+    "have_filings": true,
+    "have_extracts": true,
+    "have_pdfs": true
+  },
+  "filings_with_data": [
+    {
+      "ein": 521693387,
+      "tax_prd": 202312,
+      "tax_prd_yr": 2023,
+      "formtype": 0,
+      "pdf_url": "https://example.invalid/2023.pdf",
+      "updated": "2025-03-14T11:02:00Z",
+      "totrevenue": 2140000,
+      "totfuncexpns": 2480000,
+      "totassetsend": 1310000,
+      "totliabend": 940000,
+      "totcntrbgfts": 1980000,
+      "totprgmrevnue": 120000,
+      "compnsatncurrofcr": 310000,
+      "pct_compnsatncurrofcr": 0.125,
+      "totnetassetend": 370000,
+      "noemplyeesw3cnt": 24,
+      "unrstrctnetasstsend": 95000,
+      "temprstrctnetasstsend": 215000,
+      "permrstrctnetasstsend": 60000
+    },
+    {
+      "ein": 521693387,
+      "tax_prd": 202212,
+      "tax_prd_yr": 2022,
+      "formtype": 0,
+      "pdf_url": "https://example.invalid/2022.pdf",
+      "updated": "2024-02-01T09:31:00Z",
+      "totrevenue": 3420000,
+      "totfuncexpns": 3510000,
+      "totassetsend": 1690000,
+      "totliabend": 880000,
+      "totcntrbgfts": 3180000,
+      "totprgmrevnue": 160000,
+      "compnsatncurrofcr": 295000,
+      "pct_compnsatncurrofcr": 0.084,
+      "totnetassetend": 810000,
+      "unrstrctnetasstsend": 430000,
+      "temprstrctnetasstsend": 320000,
+      "permrstrctnetasstsend": 60000
+    },
+    {
+      "ein": 521693387,
+      "tax_prd": 202112,
+      "tax_prd_yr": 2021,
+      "formtype": 0,
+      "pdf_url": null,
+      "updated": "2023-01-19T09:31:00Z",
+      "totrevenue": 3010000,
+      "totfuncexpns": 3120000,
+      "totassetsend": 1740000,
+      "totliabend": 810000,
+      "totcntrbgfts": 2890000,
+      "totnetassetend": 930000
+    }
+  ],
+  "filings_without_data": [
+    {
+      "tax_prd": 202012,
+      "tax_prd_yr": 2020,
+      "formtype": 0,
+      "pdf_url": "https://example.invalid/2020.pdf"
+    }
+  ],
+  "data_source": "ProPublica Nonprofit Explorer API",
+  "api_version": 2
+}

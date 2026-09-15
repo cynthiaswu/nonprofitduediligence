@@ -1,0 +1,31 @@
+{
+  "organization": {
+    "ein": 843311902, "name": "CEDAR CREEK LITERACY PROJECT",
+    "address": "22 ELM ST", "city": "BURLINGTON", "state": "VT",
+    "zipcode": "05401", "subseccd": 3, "ntee_code": "B92"
+  },
+  "filings_with_data": [
+    {
+      "ein": 843311902, "tax_prd": 202312, "tax_prd_yr": 2023, "formtype": 1,
+      "pdf_url": "https://example.invalid/ez2023.pdf",
+      "totrevnue": 184000, "totexpns": 171000,
+      "totassetsend": 96000, "totliabend": 12000, "totnetassetsend": 84000,
+      "totcntrbs": 149000, "prgmservrev": 31000, "othrinvstinc": 4000,
+      "nonpfrea": 7, "totsupport170": 612000, "pubsupplesspct170": 548000,
+      "excds2pct170": 41000, "contractioncd": "N", "loanstoofficerscd": "N"
+    },
+    {
+      "ein": 843311902, "tax_prd": 202212, "tax_prd_yr": 2022, "formtype": 1,
+      "totrevnue": 158000, "totexpns": 149000,
+      "totassetsend": 83000, "totliabend": 11000, "totnetassetsend": 72000,
+      "totcntrbs": 128000, "prgmservrev": 27000
+    },
+    {
+      "ein": 843311902, "tax_prd": 202112, "tax_prd_yr": 2021, "formtype": 1,
+      "totrevnue": 131000, "totexpns": 127000,
+      "totassetsend": 74000, "totliabend": 10000, "totnetassetsend": 64000,
+      "totcntrbs": 112000, "prgmservrev": 17000
+    }
+  ],
+  "filings_without_data": []
+}

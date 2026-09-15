@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Return xmlns="http://www.irs.gov/efile" returnVersion="2011v1.2">
+  <ReturnHeader>
+    <TaxPeriodEndDate>2011-06-30</TaxPeriodEndDate>
+    <Filer><EIN>521693387</EIN>
+      <Name><BusinessNameLine1>HARBOR STREET YOUTH COALITION</BusinessNameLine1></Name></Filer>
+  </ReturnHeader>
+  <ReturnData>
+    <IRS990>
+      <ActivityOrMissionDesc>Youth mentoring.</ActivityOrMissionDesc>
+      <Form990PartVIISectionA>
+        <NamePerson>Eleanor Prybylski</NamePerson>
+        <Title>PRESIDENT</Title>
+        <AverageHoursPerWeek>35</AverageHoursPerWeek>
+        <Officer>X</Officer>
+        <ReportableCompFromOrganization>88000</ReportableCompFromOrganization>
+        <OtherCompensation>9000</OtherCompensation>
+      </Form990PartVIISectionA>
+      <TotalFunctionalExpenses>
+        <Total>900000</Total>
+        <ProgramServices>640000</ProgramServices>
+        <ManagementAndGeneral>190000</ManagementAndGeneral>
+        <Fundraising>70000</Fundraising>
+      </TotalFunctionalExpenses>
+    </IRS990>
+  </ReturnData>
+</Return>
