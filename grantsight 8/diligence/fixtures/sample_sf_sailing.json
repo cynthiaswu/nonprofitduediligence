@@ -1,0 +1,21 @@
+{
+  "organization": {
+    "ein": 992088341, "name": "OCEAN BEACH YOUTH SAILING",
+    "address": "1201 GREAT HWY", "city": "SAN FRANCISCO", "state": "CA",
+    "zipcode": "94122", "subseccd": 3, "ntee_code": "N67"
+  },
+  "filings_with_data": [
+    {"ein": 992088341, "tax_prd": 202412, "tax_prd_yr": 2024, "formtype": 1,
+     "pdf_url": "https://example.invalid/sail2024.pdf",
+     "totrevnue": 214000, "totexpns": 231000,
+     "totassetsend": 61000, "totliabend": 47000, "totnetassetsend": 14000,
+     "totcntrbs": 196000, "prgmservrev": 18000,
+     "totsupport170": 742000, "pubsupplesspct170": 198000,
+     "excds2pct170": 264000},
+    {"ein": 992088341, "tax_prd": 202312, "tax_prd_yr": 2023, "formtype": 1,
+     "totrevnue": 238000, "totexpns": 244000,
+     "totassetsend": 74000, "totliabend": 43000, "totnetassetsend": 31000,
+     "totcntrbs": 221000, "prgmservrev": 15000}
+  ],
+  "filings_without_data": []
+}
